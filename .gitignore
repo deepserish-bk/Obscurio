@@ -161,3 +161,10 @@ data/*.enc
 # Temporary files
 tmp/
 temp/
+
+# Obscurio specific ignores
+obscurio_vault.json
+obscurio_vault.enc
+user_settings.json
+*.key
+*.salt
