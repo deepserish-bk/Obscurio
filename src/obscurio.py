@@ -29,7 +29,7 @@ except ImportError:
 # GUI imports - using Tkinter (built-in)
 try:
     import tkinter as tk
-    from tkinter import ttk, messagebox, simpledialog
+    from tkinter import ttk, messagebox
     import tkinter.scrolledtext as scrolledtext
     GUI_AVAILABLE = True
 except ImportError:
@@ -160,22 +160,27 @@ class Vault:
             self.salt = base64.b64decode(salt_b64)
             self.master_key = self.encryption_manager.derive_key(password, self.salt)
             
-            # Verify by trying to decrypt first credential if exists
-            if vault_data['credentials']:
-                cred_data = vault_data['credentials'][0]
-                cred = Credential.from_dict(cred_data)
-                # Test decryption
-                self.encryption_manager.decrypt_data(
-                    self.master_key, 
-                    cred.encrypted_username, 
-                    cred.nonce
-                )
-            
-            # Load all credentials
+            # LOAD CREDENTIALS FROM FILE - FIXED
             self.credentials.clear()
-            for cred_data in vault_data['credentials']:
+            for cred_data in vault_data.get('credentials', []):
                 cred = Credential.from_dict(cred_data)
                 self.credentials[cred.service] = cred
+            
+            # Verify by trying to decrypt first credential if exists
+            if self.credentials:
+                cred = list(self.credentials.values())[0]
+                try:
+                    self.encryption_manager.decrypt_data(
+                        self.master_key, 
+                        cred.encrypted_username, 
+                        cred.nonce
+                    )
+                except ValueError:
+                    # Decryption failed - wrong password
+                    self.credentials.clear()
+                    self.master_key = None
+                    self.is_locked = True
+                    return False
             
             self.is_locked = False
             self._reset_lock_timer()
@@ -279,12 +284,6 @@ class ObscurioGUI:
         self.root.title("Obscurio - Secure Password Manager")
         self.root.geometry("800x600")
         
-        # Set icon if available
-        try:
-            self.root.iconbitmap("icon.ico")  # Windows
-        except:
-            pass
-        
         # Configure styles
         self.setup_styles()
         
@@ -328,7 +327,10 @@ class ObscurioGUI:
             ttk.Label(frame, text="Master Password:").pack(pady=5)
             self.password_entry = ttk.Entry(frame, show="•", width=30)
             self.password_entry.pack(pady=5)
-            self.password_entry.focus()
+            self.password_entry.focus_set()  # Fixed focus
+            
+            # Bind Enter key to unlock
+            self.password_entry.bind('<Return>', lambda e: self.unlock_vault())
             
             ttk.Button(frame, text="Unlock Vault", 
                       command=self.unlock_vault).pack(pady=10)
@@ -355,10 +357,14 @@ class ObscurioGUI:
         ttk.Label(frame, text="Master Password (min 12 chars):").pack(pady=5)
         self.new_password_entry = ttk.Entry(frame, show="•", width=30)
         self.new_password_entry.pack(pady=5)
+        self.new_password_entry.focus_set()
         
         ttk.Label(frame, text="Confirm Password:").pack(pady=5)
         self.confirm_password_entry = ttk.Entry(frame, show="•", width=30)
         self.confirm_password_entry.pack(pady=5)
+        
+        # Bind Enter to create vault
+        self.confirm_password_entry.bind('<Return>', lambda e: self.create_vault())
         
         # Warning label
         warning = ttk.Label(frame, 
@@ -471,8 +477,7 @@ class ObscurioGUI:
         # Bind selection event
         self.cred_listbox.bind('<<ListboxSelect>>', self.on_credential_select)
         
-        # Refresh list
-        self.refresh_credential_list()
+        # Refresh list - FIXED: Call this to show credentials
         
         # Buttons for left panel
         button_frame = ttk.Frame(left_frame)
@@ -510,10 +515,13 @@ class ObscurioGUI:
                   command=lambda: self.copy_to_clipboard("password")).pack(side="left", padx=2)
         
         # Bottom status bar
+        # Refresh credential list
+        self.refresh_credential_list()
+
         status_frame = ttk.Frame(self.root, relief="sunken", borderwidth=1)
         status_frame.pack(side="bottom", fill="x")
         
-        self.status_text = tk.StringVar(value="Ready")
+        self.status_text = tk.StringVar(value=f"Loaded {len(self.vault.credentials)} credentials")
         ttk.Label(status_frame, textvariable=self.status_text).pack(side="left", padx=5)
         
         # Auto-lock warning
@@ -524,10 +532,13 @@ class ObscurioGUI:
     def refresh_credential_list(self):
         """Refresh the list of credentials."""
         self.cred_listbox.delete(0, tk.END)
-        for service in sorted(self.vault.credentials.keys()):
-            self.cred_listbox.insert(tk.END, service)
         
-        self.status_text.set(f"Found {len(self.vault.credentials)} credentials")
+        if not self.vault.credentials:
+            self.status_text.set("No credentials found. Click 'Add New' to create one.")
+        else:
+            for service in sorted(self.vault.credentials.keys()):
+                self.cred_listbox.insert(tk.END, service)
+            self.status_text.set(f"Found {len(self.vault.credentials)} credentials")
     
     def on_credential_select(self, event):
         """Handle credential selection from list."""
@@ -578,19 +589,38 @@ class ObscurioGUI:
             entry.grid(row=i, column=1, padx=10, pady=5, sticky="ew")
             entries[key] = entry
         
+        # Focus on service field
+        entries["service"].focus_set()
+        
         # Buttons
         button_frame = ttk.Frame(dialog)
         button_frame.grid(row=len(fields), column=0, columnspan=2, pady=20)
         
         def save_credential():
+            service = entries["service"].get().strip()
+            username = entries["username"].get().strip()
+            password = entries["password"].get().strip()
+            
+            if not service:
+                messagebox.showerror("Error", "Service name is required")
+                return
+            if not username:
+                messagebox.showerror("Error", "Username is required")
+                return
+            if not password:
+                messagebox.showerror("Error", "Password is required")
+                return
+            
             try:
                 self.vault.add_credential(
-                    service=entries["service"].get(),
-                    username=entries["username"].get(),
-                    password=entries["password"].get(),
-                    url=entries["url"].get(),
-                    notes=entries["notes"].get()
+                    service=service,
+                    username=username,
+                    password=password,
+                    url=entries["url"].get().strip(),
+                    notes=entries["notes"].get().strip()
                 )
+                # SAVE TO FILE - FIXED
+                self.vault.save_vault()
                 self.refresh_credential_list()
                 dialog.destroy()
                 messagebox.showinfo("Success", "Credential added successfully!")
@@ -601,6 +631,9 @@ class ObscurioGUI:
                   command=save_credential).pack(side="left", padx=5)
         ttk.Button(button_frame, text="Cancel", 
                   command=dialog.destroy).pack(side="left", padx=5)
+        
+        # Bind Enter to save
+        entries["notes"].bind('<Return>', lambda e: save_credential())
     
     def delete_selected_credential(self):
         """Delete selected credential."""
@@ -614,6 +647,11 @@ class ObscurioGUI:
         if messagebox.askyesno("Confirm Delete", 
                               f"Delete credential for '{service}'?"):
             del self.vault.credentials[service]
+            # Save after deletion
+            try:
+                self.vault.save_vault()
+            except:
+                pass
             self.refresh_credential_list()
             # Clear detail fields
             for var in self.detail_vars.values():
@@ -647,7 +685,7 @@ class ObscurioGUI:
                 self.root.clipboard_clear()
                 self.status_text.set("Clipboard cleared for security")
             
-            self.root.after(30000, clear_clipboard)  # 30 seconds
+            self.root.after(30000, clear_clipboard)
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to copy to clipboard: {str(e)}")
@@ -657,11 +695,19 @@ class ObscurioGUI:
         try:
             self.vault.save_vault()
             self.status_text.set("Vault saved successfully")
+            messagebox.showinfo("Success", "Vault saved successfully!")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save vault: {str(e)}")
     
     def lock_vault(self):
         """Lock the vault and return to login screen."""
+        save = messagebox.askyesno("Lock Vault", "Save vault before locking?")
+        if save:
+            try:
+                self.vault.save_vault()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to save: {str(e)}")
+        
         self.vault.lock()
         self.show_login_screen()
     
@@ -675,16 +721,10 @@ class ObscurioGUI:
         """Start the GUI application."""
         self.root.mainloop()
 
-def main():
-    """Main entry point - starts GUI if available, otherwise CLI."""
+if __name__ == "__main__":
+    """Main entry point."""
     if GUI_AVAILABLE:
         app = ObscurioGUI()
         app.run()
     else:
-        print("GUI not available. Starting terminal version...")
-        # Fallback to terminal version
-        import src.obscurio_terminal as terminal
-        terminal.main()
-
-if __name__ == "__main__":
-    main()
+        print("GUI not available.")
