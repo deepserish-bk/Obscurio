@@ -1,4 +1,4 @@
-cat > README.md << 'EOF'
+
 # Obscurio - Secure Password Manager
 
 A local, encrypted password manager built with Python using modern cryptographic standards. Designed for security-conscious users who want complete control over their credential storage.
@@ -128,13 +128,3 @@ Submit a pull request
 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-
-Acknowledgments
-
-University of Padua Cybersecurity Program inspiration
-Cryptography.io library for robust cryptographic primitives
-Python community for development tools and best practices
-Contact
-
-For questions or security concerns regarding this project, please open an issue on GitHub.
-EOF
