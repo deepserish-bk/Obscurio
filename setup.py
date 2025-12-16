@@ -28,7 +28,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "obscurio=obscurio:main",
+            "obscurio=obscurio:main",  # This means: "from obscurio import main"
         ],
     },
 )
