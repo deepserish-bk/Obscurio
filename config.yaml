@@ -1,0 +1,21 @@
+# Obscurio Configuration
+security:
+  auto_lock_minutes: 5
+  scrypt_n: 16384
+  scrypt_r: 8
+  scrypt_p: 1
+  min_password_length: 12
+  
+storage:
+  vault_file: "obscurio_vault.json"
+  backup_dir: "backups"
+  max_backups: 5
+  
+logging:
+  audit_log: "obscurio_audit.log"
+  log_level: "INFO"
+  
+features:
+  clipboard_clear_seconds: 30
+  password_generator: true
+  import_export: true

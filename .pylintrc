@@ -1,0 +1,37 @@
+[MASTER]
+jobs=1
+ignore-patterns=test_.*?py
+
+[MESSAGES CONTROL]
+disable=
+    C0111,  # missing-docstring
+    C0103,  # invalid-name
+    R0903,  # too-few-public-methods
+    R0913,  # too-many-arguments
+    R0914,  # too-many-locals
+    W0703,  # broad-except
+
+[FORMAT]
+max-line-length=100
+indent-string='    '
+
+[BASIC]
+good-names=i,j,k,ex,Run,_
+variable-rgx=[a-z_][a-z0-9_]{0,30}$'
+argument-rgx=[a-z_][a-z0-9_]{0,30}$'
+
+[DESIGN]
+max-args=7
+max-locals=20
+max-returns=6
+max-branches=15
+max-statements=50
+max-parents=7
+max-attributes=15
+min-public-methods=1
+
+[TYPECHECK]
+generated-members=cryptography
+
+[SIMILARITIES]
+min-similarity-lines=8

@@ -1,507 +1,690 @@
-# Password Vault (Tkinter) with single-file AES-GCM encryption and Scrypt KDF
-# Requirements: Python 3.9+, cryptography
-#   pip install cryptography
+#!/usr/bin/env python3
+"""
+Obscurio - Secure Password Manager with GUI
+AES-GCM encrypted password vault with Scrypt key derivation.
+"""
 
 import json
+import base64
 import os
-import secrets
-import struct
 import sys
-from cryptography import __version__ as cryptography_version
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, Optional, Tuple, List
-import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+import threading
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+import secrets
 
-from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+# Core cryptography imports
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.exceptions import InvalidTag
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    print("ERROR: Required cryptography library not found.")
+    print("Install with: pip install cryptography")
+    sys.exit(1)
 
-# Debug prints (optional, can remove after confirming it works)
-print("Python executable:", sys.executable)
-print("cryptography version:", cryptography_version)
-
-# ------------------------- Vault storage and crypto -------------------------
-
-HEADER_MAGIC = b"PWSAFE1"  # 7 bytes
-VERSION = 1
-KDF_ID_SCRYPT = 1
-AEAD_ID_AESGCM = 1
-
-HEADER_FMT = "!7sBBBBHH"
-HEADER_STATIC_SIZE = struct.calcsize(HEADER_FMT)  # without salt
-
-DEFAULT_SCRYPT_N_LOG2 = 14  # 2**14 = 16384
-DEFAULT_SCRYPT_R = 8
-DEFAULT_SCRYPT_P = 1
-SALT_LEN = 16
-NONCE_LEN = 12  # AESGCM standard nonce length
-KEY_LEN = 32    # AES-256-GCM
+# GUI imports - using Tkinter (built-in)
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, simpledialog
+    import tkinter.scrolledtext as scrolledtext
+    GUI_AVAILABLE = True
+except ImportError:
+    print("ERROR: Tkinter not available. GUI cannot be loaded.")
+    GUI_AVAILABLE = False
 
 @dataclass
-class VaultData:
-    entries: Dict[str, Dict[str, str]] = field(default_factory=dict)
-    created: float = field(default_factory=lambda: time.time())
-    modified: float = field(default_factory=lambda: time.time())
+class Credential:
+    """Encrypted credential entry."""
+    service: str
+    encrypted_username: str
+    encrypted_password: str
+    url: str = ""
+    notes: str = ""
+    created: str = ""
+    updated: str = ""
+    nonce: str = ""
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'Credential':
+        return cls(**data)
 
-class VaultError(Exception):
-    pass
+class EncryptionManager:
+    """Handles all cryptographic operations."""
+    
+    def __init__(self):
+        self.scrypt_n = 2**14
+        self.scrypt_r = 8
+        self.scrypt_p = 1
+        self.salt_size = 16
+        self.nonce_size = 12
+    
+    def generate_salt(self) -> bytes:
+        return secrets.token_bytes(self.salt_size)
+    
+    def generate_nonce(self) -> bytes:
+        return secrets.token_bytes(self.nonce_size)
+    
+    def derive_key(self, password: str, salt: bytes) -> bytes:
+        kdf = Scrypt(
+            salt=salt,
+            length=32,
+            n=self.scrypt_n,
+            r=self.scrypt_r,
+            p=self.scrypt_p,
+            backend=default_backend()
+        )
+        return kdf.derive(password.encode('utf-8'))
+    
+    def encrypt_data(self, key: bytes, plaintext: str) -> tuple[str, str]:
+        nonce = self.generate_nonce()
+        aesgcm = AESGCM(key)
+        ciphertext = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), None)
+        return base64.b64encode(ciphertext).decode('utf-8'), \
+               base64.b64encode(nonce).decode('utf-8')
+    
+    def decrypt_data(self, key: bytes, encrypted_data: str, nonce_b64: str) -> str:
+        try:
+            aesgcm = AESGCM(key)
+            ciphertext = base64.b64decode(encrypted_data)
+            nonce = base64.b64decode(nonce_b64)
+            plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+            return plaintext.decode('utf-8')
+        except InvalidTag:
+            raise ValueError("Decryption failed - invalid tag")
+        except Exception as e:
+            raise ValueError(f"Decryption error: {str(e)}")
 
 class Vault:
-    def __init__(self, path: Path):
-        self.path = Path(path)
-        self.header_bytes: Optional[bytes] = None
-        self.kdf_params: Tuple[int, int, int] = (DEFAULT_SCRYPT_N_LOG2, DEFAULT_SCRYPT_R, DEFAULT_SCRYPT_P)
+    """Main vault management class."""
+    
+    def __init__(self, vault_path: str = "obscurio_vault.json"):
+        self.vault_path = vault_path
+        self.credentials: Dict[str, Credential] = {}
+        self.encryption_manager = EncryptionManager()
+        self.master_key: Optional[bytes] = None
         self.salt: Optional[bytes] = None
-        self.data: VaultData = VaultData()
-
-    @staticmethod
-    def derive_key_scrypt(password: str, salt: bytes, n_log2: int, r: int, p: int) -> bytes:
-        kdf = Scrypt(salt=salt, length=KEY_LEN, n=1 << n_log2, r=r, p=p)
-        return kdf.derive(password.encode("utf-8"))
-
-    def build_header(self, salt: bytes, kdf_params: Tuple[int, int, int]) -> bytes:
-        n_log2, r, p = kdf_params
-        header_wo_salt = struct.pack(
-            HEADER_FMT,
-            HEADER_MAGIC,
-            VERSION,
-            KDF_ID_SCRYPT,
-            AEAD_ID_AESGCM,
-            len(salt),
-            n_log2,
-            r,
-            p,
-        )
-        return header_wo_salt + salt
-
-    @staticmethod
-    def parse_header(data: bytes) -> Tuple[bytes, int, int, int, bytes]:
-        if len(data) < HEADER_STATIC_SIZE:
-            raise VaultError("Vault file header too small or corrupted.")
-        magic, version, kdf_id, aead_id, salt_len, n_log2, r, p = struct.unpack(HEADER_FMT, data[:HEADER_STATIC_SIZE])
-        if magic != HEADER_MAGIC:
-            raise VaultError("Invalid vault file (bad magic).")
-        if version != VERSION:
-            raise VaultError(f"Unsupported vault version: {version}")
-        if kdf_id != KDF_ID_SCRYPT or aead_id != AEAD_ID_AESGCM:
-            raise VaultError("Unsupported KDF/AEAD.")
-        if len(data) < HEADER_STATIC_SIZE + salt_len:
-            raise VaultError("Vault file header truncated (salt).")
-        salt = data[HEADER_STATIC_SIZE:HEADER_STATIC_SIZE + salt_len]
-        header_bytes = data[:HEADER_STATIC_SIZE + salt_len]
-        return header_bytes, n_log2, r, p, salt
-
-    def exists(self) -> bool:
-        return self.path.exists()
-
-    def create_new(self, master_password: str) -> None:
-        self.salt = os.urandom(SALT_LEN)
-        self.kdf_params = (DEFAULT_SCRYPT_N_LOG2, DEFAULT_SCRYPT_R, DEFAULT_SCRYPT_P)
-        self.header_bytes = self.build_header(self.salt, self.kdf_params)
-        self.data = VaultData()
-        self._save_with_key(self._derive_key(master_password))
-
-    def unlock(self, master_password: str) -> None:
-        raw = self.path.read_bytes()
-        header_bytes, n_log2, r, p, salt = self.parse_header(raw)
-        self.header_bytes = header_bytes
-        self.kdf_params = (n_log2, r, p)
-        self.salt = salt
-        body = raw[len(header_bytes):]
-        if len(body) < NONCE_LEN + 16:
-            raise VaultError("Vault file is too short.")
-        nonce = body[:NONCE_LEN]
-        ciphertext = body[NONCE_LEN:]
-        key = self._derive_key(master_password)
-        aead = AESGCM(key)
-        try:
-            plaintext = aead.decrypt(nonce, ciphertext, header_bytes)
-        except Exception as e:
-            raise VaultError("Wrong master password or file is corrupted.") from e
-        self.data = VaultData(**json.loads(plaintext.decode("utf-8")))
-
-    def save(self, master_password: str) -> None:
-        if not self.header_bytes or not self.salt:
-            raise VaultError("Vault not initialized.")
-        self.data.modified = time.time()
-        self._save_with_key(self._derive_key(master_password))
-
-    def _derive_key(self, master_password: str) -> bytes:
-        if not self.salt:
-            raise VaultError("Missing salt.")
-        n_log2, r, p = self.kdf_params
-        return self.derive_key_scrypt(master_password, self.salt, n_log2, r, p)
-
-    def _save_with_key(self, key: bytes) -> None:
-        if not self.header_bytes:
-            raise VaultError("Missing header.")
-        aead = AESGCM(key)
-        nonce = secrets.token_bytes(NONCE_LEN)
-        payload = json.dumps(self.data.__dict__).encode("utf-8")
-        ciphertext = aead.encrypt(nonce, payload, self.header_bytes)
-        blob = self.header_bytes + nonce + ciphertext
-        self._atomic_write(self.path, blob)
-
-    @staticmethod
-    def _atomic_write(path: Path, data: bytes) -> None:
-        path = Path(path)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        if hasattr(os, "O_BINARY"):
-            flags |= os.O_BINARY
-        fd = os.open(str(tmp_path), flags, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(str(tmp_path), str(path))
-        finally:
-            try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
-            except Exception:
-                pass
-
-    def list_services(self) -> List[str]:
-        return sorted(self.data.entries.keys(), key=str.lower)
-
-    def get_entry(self, service: str) -> Optional[Dict[str, str]]:
-        return self.data.entries.get(service)
-
-    def set_entry(self, service: str, username: str, password: str) -> None:
-        self.data.entries[service] = {"username": username, "password": password, "updated": time.time()}
-
-    def delete_entry(self, service: str) -> None:
-        self.data.entries.pop(service, None)
-
-
-# ------------------------- GUI -------------------------
-
-AUTO_LOCK_SECONDS = 180
-CLIPBOARD_CLEAR_MS = 20000
-
-class PasswordDialog(simpledialog.Dialog):
-    def __init__(self, parent, title, confirm=False, prompt="Enter master password"):
-        self.confirm = confirm
-        self.prompt = prompt
-        self.password = None
-        super().__init__(parent, title)
-
-    def body(self, master):
-        ttk.Label(master, text=self.prompt).grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=4)
-        self.var1 = tk.StringVar()
-        self.var2 = tk.StringVar()
-        self.e1 = ttk.Entry(master, textvariable=self.var1, show="*")
-        self.e1.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
-        if self.confirm:
-            ttk.Label(master, text="Confirm:").grid(row=2, column=0, sticky="w", padx=4)
-            self.e2 = ttk.Entry(master, textvariable=self.var2, show="*")
-            self.e2.grid(row=2, column=1, sticky="ew", padx=4, pady=4)
-        master.columnconfigure(1, weight=1)
-        return self.e1
-
-    def validate(self):
-        pw1 = self.var1.get()
-        if not pw1:
-            messagebox.showerror("Error", "Password cannot be empty")
+        self.is_locked = True
+        self.auto_lock_minutes = 5
+        self.lock_timer: Optional[threading.Timer] = None
+        
+        self.version = "1.0"
+        self.created = datetime.now().isoformat()
+        self.modified = self.created
+    
+    def _reset_lock_timer(self):
+        """Reset the auto-lock timer."""
+        if self.lock_timer:
+            self.lock_timer.cancel()
+        
+        if not self.is_locked and self.auto_lock_minutes > 0:
+            self.lock_timer = threading.Timer(
+                self.auto_lock_minutes * 60,
+                self._auto_lock
+            )
+            self.lock_timer.daemon = True
+            self.lock_timer.start()
+    
+    def _auto_lock(self):
+        """Auto-lock the vault."""
+        if not self.is_locked:
+            self.lock()
+            if GUI_AVAILABLE and hasattr(self, 'gui'):
+                self.gui.on_vault_locked()
+    
+    def create_vault(self, password: str) -> bool:
+        if os.path.exists(self.vault_path):
             return False
-        if self.confirm:
-            pw2 = self.var2.get()
-            if pw1 != pw2:
-                messagebox.showerror("Error", "Passwords do not match")
-                return False
-        self.password = pw1
+        
+        self.salt = self.encryption_manager.generate_salt()
+        self.master_key = self.encryption_manager.derive_key(password, self.salt)
+        self.is_locked = False
+        self._reset_lock_timer()
         return True
-
-
-class App(tk.Tk):
-    def __init__(self, vault_path: Path):
-        super().__init__()
-        self.title("Password Vault")
-        self.geometry("700x420")
-        self.minsize(640, 380)
-
-        self.vault = Vault(vault_path)
-        self.master_password: Optional[str] = None
-
-        self.last_activity_ts = time.time()
-        self.clipboard_clear_job = None
-        self.locked_overlay = None
-
-        self._build_ui()
-        self._bind_activity()
-        self.after(1000, self._idle_check)
-
-        self._startup_flow()
-
-    # ----- UI build -----
-    def _build_ui(self):
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(0, weight=1)
-
-        # Left frame
-        left = ttk.Frame(self)
-        left.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        left.rowconfigure(1, weight=1)
-        ttk.Label(left, text="Services").grid(row=0, column=0, sticky="w")
-        self.services_list = tk.Listbox(left, height=18)
-        self.services_list.grid(row=1, column=0, sticky="nsew")
-        self.services_list.bind("<<ListboxSelect>>", self._on_select_service)
-        btns_left = ttk.Frame(left)
-        btns_left.grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        ttk.Button(btns_left, text="Delete", command=self.delete_entry).pack(side="left")
-        ttk.Button(btns_left, text="Refresh", command=self.refresh_services).pack(side="left", padx=(6, 0))
-
-        # Right frame
-        right = ttk.Frame(self)
-        right.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
-        for i in range(2):
-            right.columnconfigure(i, weight=1)
-
-        ttk.Label(right, text="Service").grid(row=0, column=0, sticky="w")
-        self.var_service = tk.StringVar()
-        self.entry_service = ttk.Entry(right, textvariable=self.var_service)
-        self.entry_service.grid(row=0, column=1, sticky="ew", pady=2)
-
-        ttk.Label(right, text="Username").grid(row=1, column=0, sticky="w")
-        self.var_username = tk.StringVar()
-        self.entry_username = ttk.Entry(right, textvariable=self.var_username)
-        self.entry_username.grid(row=1, column=1, sticky="ew", pady=2)
-
-        ttk.Label(right, text="Password").grid(row=2, column=0, sticky="w")
-        self.var_password = tk.StringVar()
-        self.entry_password = ttk.Entry(right, textvariable=self.var_password, show="•")
-        self.entry_password.grid(row=2, column=1, sticky="ew", pady=2)
-
-        buttons = ttk.Frame(right)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(buttons, text="Generate", command=self.generate_password).pack(side="left")
-        ttk.Button(buttons, text="Reveal", command=self.toggle_reveal).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Copy", command=self.copy_password).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Save Entry", command=self.save_entry).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Load Entry", command=self.load_entry).pack(side="left", padx=(6, 0))
-
-        ttk.Separator(right, orient="horizontal").grid(row=4, column=0, columnspan=2, sticky="ew", pady=8)
-
-        bottom = ttk.Frame(right)
-        bottom.grid(row=5, column=0, columnspan=2, sticky="ew")
-        ttk.Button(bottom, text="Lock", command=self.lock).pack(side="left")
-        ttk.Button(bottom, text="Save Vault", command=self.save_vault).pack(side="left", padx=(6, 0))
-        ttk.Label(bottom, text=f"Idle auto-lock: {AUTO_LOCK_SECONDS}s").pack(side="right")
-
-    # ----- Activity and idle -----
-    def _bind_activity(self):
-        def touch(_=None):
-            self.last_activity_ts = time.time()
-        for seq in ("<Key>", "<Button>", "<Motion>", "<<ListboxSelect>>"):
-            self.bind_all(seq, touch)
-
-    def _startup_flow(self):
+    
+    def unlock_vault(self, password: str) -> bool:
+        if not os.path.exists(self.vault_path):
+            return False
+        
         try:
-            if self.vault.exists():
-                while True:
-                    dlg = PasswordDialog(self, "Unlock Vault")
-                    if dlg.password is None:
-                        self.quit()
-                        return
-                    try:
-                        self.vault.unlock(dlg.password)
-                        self.master_password = dlg.password
-                        break
-                    except VaultError as e:
-                        messagebox.showerror("Unlock failed", str(e))
-                        continue
-            else:
-                dlg = PasswordDialog(self, "Create Vault", confirm=True, prompt="Create a master password")
-                if dlg.password is None:
-                    self.quit()
-                    return
-                self.vault.create_new(dlg.password)
-                self.master_password = dlg.password
+            with open(self.vault_path, 'r') as f:
+                vault_data = json.load(f)
+            
+            salt_b64 = vault_data['salt']
+            self.salt = base64.b64decode(salt_b64)
+            self.master_key = self.encryption_manager.derive_key(password, self.salt)
+            
+            # Verify by trying to decrypt first credential if exists
+            if vault_data['credentials']:
+                cred_data = vault_data['credentials'][0]
+                cred = Credential.from_dict(cred_data)
+                # Test decryption
+                self.encryption_manager.decrypt_data(
+                    self.master_key, 
+                    cred.encrypted_username, 
+                    cred.nonce
+                )
+            
+            # Load all credentials
+            self.credentials.clear()
+            for cred_data in vault_data['credentials']:
+                cred = Credential.from_dict(cred_data)
+                self.credentials[cred.service] = cred
+            
+            self.is_locked = False
+            self._reset_lock_timer()
+            return True
+            
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to open vault: {e}")
-            self.quit()
-            return
-        self.refresh_services()
-
-    def _idle_check(self):
-        if self.master_password is not None:
-            idle = time.time() - self.last_activity_ts
-            if idle >= AUTO_LOCK_SECONDS:
-                self.lock()
-        self.after(1000, self._idle_check)
-
-    # ----- Lock / Unlock -----
-    def lock(self):
-        if self.master_password is None:
-            return
-        self.master_password = None
-        self.vault.data = VaultData()
-        if self.locked_overlay:
-            return
-        self.locked_overlay = tk.Toplevel(self)
-        self.locked_overlay.title("Locked")
-        self.locked_overlay.transient(self)
-        self.locked_overlay.grab_set()
-        self.locked_overlay.geometry("300x120+{}+{}".format(self.winfo_rootx() + 50, self.winfo_rooty() + 50))
-        self.locked_overlay.protocol("WM_DELETE_WINDOW", lambda: None)
-        ttk.Label(self.locked_overlay, text="Vault is locked").pack(pady=10)
-        btn = ttk.Button(self.locked_overlay, text="Unlock", command=self._unlock_from_overlay)
-        btn.pack()
-        btn.focus_set()
-
-    def _unlock_from_overlay(self):
-        dlg = PasswordDialog(self.locked_overlay, "Unlock Vault")
-        if dlg.password is None:
-            return
-        try:
-            self.vault.unlock(dlg.password)
-            self.master_password = dlg.password
-            self.locked_overlay.destroy()
-            self.locked_overlay = None
-            self.refresh_services()
-            messagebox.showinfo("Unlocked", "Vault unlocked.")
-        except VaultError as e:
-            messagebox.showerror("Unlock failed", str(e))
-
-    # ----- Entry operations -----
-    def refresh_services(self):
-        self.services_list.delete(0, tk.END)
-        for svc in self.vault.list_services():
-            self.services_list.insert(tk.END, svc)
-
-    def _on_select_service(self, event=None):
-        sel = self.services_list.curselection()
-        if not sel:
-            return
-        svc = self.services_list.get(sel[0])
-        self.var_service.set(svc)
-        entry = self.vault.get_entry(svc)
-        if entry:
-            self.var_username.set(entry.get("username", ""))
-            self.var_password.set(entry.get("password", ""))
-
-    def save_entry(self):
-        if not self._ensure_unlocked():
-            return
-        svc = self.var_service.get().strip()
-        if not svc:
-            messagebox.showerror("Error", "Service name is required.")
-            return
-        username = self.var_username.get()
-        password = self.var_password.get()
-        self.vault.set_entry(svc, username, password)
-        try:
-            self.vault.save(self.master_password)
-            self.refresh_services()
-            messagebox.showinfo("Saved", f"Entry saved for '{svc}'.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save: {e}")
-
-    def load_entry(self):
-        svc = self.var_service.get().strip()
-        if not svc:
-            messagebox.showerror("Error", "Enter a service name or select one.")
-            return
-        entry = self.vault.get_entry(svc)
-        if not entry:
-            messagebox.showinfo("Not found", f"No entry for '{svc}'.")
-            return
-        self.var_username.set(entry.get("username", ""))
-        self.var_password.set(entry.get("password", ""))
-
-    def delete_entry(self):
-        if not self._ensure_unlocked():
-            return
-        sel = self.services_list.curselection()
-        if not sel:
-            svc = self.var_service.get().strip()
-        else:
-            svc = self.services_list.get(sel[0])
-        if not svc:
-            messagebox.showerror("Error", "Select or enter a service to delete.")
-            return
-        if not messagebox.askyesno("Confirm", f"Delete entry '{svc}'? This cannot be undone."):
-            return
-        self.vault.delete_entry(svc)
-        try:
-            self.vault.save(self.master_password)
-            self.refresh_services()
-            self.var_service.set("")
-            self.var_username.set("")
-            self.var_password.set("")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save: {e}")
-
-    # ----- Helpers -----
-    def generate_password(self):
-        length = 20
-        alphabet = (
-            "ABCDEFGHJKLMNPQRSTUVWXYZ"
-            "abcdefghijkmnopqrstuvwxyz"
-            "23456789"
-            "!@#$%^&*()-_=+[]{};:,.?"
+            print(f"Unlock failed: {str(e)}")
+            self.master_key = None
+            self.is_locked = True
+            return False
+    
+    def add_credential(self, service: str, username: str, password: str, **kwargs):
+        if self.is_locked:
+            raise RuntimeError("Vault is locked")
+        
+        if not self.master_key:
+            raise RuntimeError("Master key not available")
+        
+        enc_username, nonce_user = self.encryption_manager.encrypt_data(
+            self.master_key, username
         )
-        pwd = "".join(secrets.choice(alphabet) for _ in range(length))
-        self.var_password.set(pwd)
-
-    def toggle_reveal(self):
-        if self.entry_password.cget("show") == "":
-            self.entry_password.config(show="•")
-        else:
-            self.entry_password.config(show="")
-
-    def copy_password(self):
-        pwd = self.var_password.get()
-        if not pwd:
-            return
+        enc_password, _ = self.encryption_manager.encrypt_data(
+            self.master_key, password
+        )
+        
+        cred = Credential(
+            service=service,
+            encrypted_username=enc_username,
+            encrypted_password=enc_password,
+            nonce=nonce_user,
+            created=datetime.now().isoformat(),
+            updated=datetime.now().isoformat(),
+            **kwargs
+        )
+        
+        self.credentials[service] = cred
+        self.modified = datetime.now().isoformat()
+        self._reset_lock_timer()
+    
+    def get_credential(self, service: str) -> Optional[tuple[str, str]]:
+        if self.is_locked:
+            return None
+        
+        if service not in self.credentials:
+            return None
+        
+        self._reset_lock_timer()
+        cred = self.credentials[service]
+        
         try:
-            self.clipboard_clear()
-            self.clipboard_append(pwd)
-            self.update()
-            if self.clipboard_clear_job:
-                self.after_cancel(self.clipboard_clear_job)
-            self.clipboard_clear_job = self.after(CLIPBOARD_CLEAR_MS, self._clear_clipboard_safe)
-            messagebox.showinfo("Copied", "Password copied to clipboard (will clear automatically).")
-        except Exception as e:
-            messagebox.showerror("Clipboard", f"Failed to copy: {e}")
-
-    def _clear_clipboard_safe(self):
-        try:
-            self.clipboard_clear()
-            self.update()
-        except Exception:
-            pass
-        self.clipboard_clear_job = None
-
+            username = self.encryption_manager.decrypt_data(
+                self.master_key, cred.encrypted_username, cred.nonce
+            )
+            password = self.encryption_manager.decrypt_data(
+                self.master_key, cred.encrypted_password, cred.nonce
+            )
+            return username, password
+        except ValueError as e:
+            print(f"Decryption failed: {str(e)}")
+            return None
+    
     def save_vault(self):
-        if not self._ensure_unlocked():
-            return
+        if self.is_locked:
+            raise RuntimeError("Cannot save locked vault")
+        
+        vault_data = {
+            'version': self.version,
+            'created': self.created,
+            'modified': self.modified,
+            'salt': base64.b64encode(self.salt).decode('utf-8') if self.salt else '',
+            'credentials': [cred.to_dict() for cred in self.credentials.values()]
+        }
+        
+        with open(self.vault_path, 'w') as f:
+            json.dump(vault_data, f, indent=2)
+        
+        self._reset_lock_timer()
+    
+    def lock(self):
+        if self.lock_timer:
+            self.lock_timer.cancel()
+        
+        if self.master_key:
+            self.master_key = b'\x00' * len(self.master_key)
+            self.master_key = None
+        
+        self.is_locked = True
+
+class ObscurioGUI:
+    """Main GUI application."""
+    
+    def __init__(self):
+        self.vault = Vault()
+        self.vault.gui = self  # Allow vault to call GUI methods
+        
+        if not GUI_AVAILABLE:
+            messagebox.showerror("Error", "Tkinter not available. Cannot start GUI.")
+            sys.exit(1)
+        
+        self.root = tk.Tk()
+        self.root.title("Obscurio - Secure Password Manager")
+        self.root.geometry("800x600")
+        
+        # Set icon if available
         try:
-            self.vault.save(self.master_password)
-            messagebox.showinfo("Saved", "Vault saved.")
+            self.root.iconbitmap("icon.ico")  # Windows
+        except:
+            pass
+        
+        # Configure styles
+        self.setup_styles()
+        
+        # Start with login screen
+        self.show_login_screen()
+    
+    def setup_styles(self):
+        """Configure GUI styles."""
+        style = ttk.Style()
+        style.configure("Title.TLabel", font=("Arial", 16, "bold"))
+        style.configure("Heading.TLabel", font=("Arial", 12, "bold"))
+        style.configure("Success.TLabel", foreground="green")
+        style.configure("Error.TLabel", foreground="red")
+    
+    def clear_window(self):
+        """Clear all widgets from window."""
+        for widget in self.root.winfo_children():
+            widget.destroy()
+    
+    def show_login_screen(self):
+        """Show login/create vault screen."""
+        self.clear_window()
+        
+        # Title
+        title = ttk.Label(self.root, text="🔐 Obscurio Password Manager", 
+                         style="Title.TLabel")
+        title.pack(pady=20)
+        
+        # Frame for options
+        frame = ttk.Frame(self.root, padding="20")
+        frame.pack(fill="both", expand=True)
+        
+        # Check if vault exists
+        vault_exists = os.path.exists(self.vault.vault_path)
+        
+        if vault_exists:
+            # Login to existing vault
+            ttk.Label(frame, text="Unlock Existing Vault", 
+                     style="Heading.TLabel").pack(pady=10)
+            
+            ttk.Label(frame, text="Master Password:").pack(pady=5)
+            self.password_entry = ttk.Entry(frame, show="•", width=30)
+            self.password_entry.pack(pady=5)
+            self.password_entry.focus()
+            
+            ttk.Button(frame, text="Unlock Vault", 
+                      command=self.unlock_vault).pack(pady=10)
+            
+            ttk.Button(frame, text="Create New Vault", 
+                      command=self.show_create_vault_screen).pack(pady=5)
+        
+        else:
+            # Create new vault
+            self.show_create_vault_screen()
+    
+    def show_create_vault_screen(self):
+        """Show screen for creating new vault."""
+        self.clear_window()
+        
+        title = ttk.Label(self.root, text="Create New Vault", 
+                         style="Title.TLabel")
+        title.pack(pady=20)
+        
+        frame = ttk.Frame(self.root, padding="20")
+        frame.pack(fill="both", expand=True)
+        
+        # Password fields
+        ttk.Label(frame, text="Master Password (min 12 chars):").pack(pady=5)
+        self.new_password_entry = ttk.Entry(frame, show="•", width=30)
+        self.new_password_entry.pack(pady=5)
+        
+        ttk.Label(frame, text="Confirm Password:").pack(pady=5)
+        self.confirm_password_entry = ttk.Entry(frame, show="•", width=30)
+        self.confirm_password_entry.pack(pady=5)
+        
+        # Warning label
+        warning = ttk.Label(frame, 
+            text="⚠️ IMPORTANT: If you lose this password, your data cannot be recovered.",
+            foreground="orange", wraplength=400)
+        warning.pack(pady=10)
+        
+        # Buttons
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(pady=20)
+        
+        ttk.Button(button_frame, text="Create Vault", 
+                  command=self.create_vault).pack(side="left", padx=5)
+        
+        if os.path.exists(self.vault.vault_path):
+            ttk.Button(button_frame, text="Back to Login", 
+                      command=self.show_login_screen).pack(side="left", padx=5)
+    
+    def unlock_vault(self):
+        """Attempt to unlock vault with entered password."""
+        password = self.password_entry.get()
+        
+        if not password:
+            messagebox.showerror("Error", "Please enter a password")
+            return
+        
+        # Show loading
+        self.root.config(cursor="wait")
+        self.root.update()
+        
+        try:
+            if self.vault.unlock_vault(password):
+                self.show_main_screen()
+            else:
+                messagebox.showerror("Error", "Incorrect password or corrupted vault")
+        finally:
+            self.root.config(cursor="")
+    
+    def create_vault(self):
+        """Create new vault with entered password."""
+        password = self.new_password_entry.get()
+        confirm = self.confirm_password_entry.get()
+        
+        if len(password) < 12:
+            messagebox.showwarning("Weak Password", 
+                "Password should be at least 12 characters for security.")
+            return
+        
+        if password != confirm:
+            messagebox.showerror("Error", "Passwords do not match")
+            return
+        
+        if not self.vault.create_vault(password):
+            messagebox.showerror("Error", "Vault already exists or creation failed")
+            return
+        
+        messagebox.showinfo("Success", "Vault created successfully!")
+        self.show_main_screen()
+    
+    def show_main_screen(self):
+        """Show main application screen with credentials."""
+        self.clear_window()
+        
+        # Menu bar
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+        
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Save Vault", command=self.save_vault)
+        file_menu.add_separator()
+        file_menu.add_command(label="Lock Vault", command=self.lock_vault)
+        file_menu.add_command(label="Exit", command=self.root.quit)
+        
+        # Title
+        title_frame = ttk.Frame(self.root)
+        title_frame.pack(fill="x", padx=20, pady=10)
+        
+        ttk.Label(title_frame, text="Obscurio Password Manager", 
+                 style="Title.TLabel").pack(side="left")
+        
+        # Status indicator
+        self.status_label = ttk.Label(title_frame, text="🔓 Unlocked", 
+                                     foreground="green")
+        self.status_label.pack(side="right")
+        
+        # Main content frame
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        
+        # Left panel - Credentials list
+        left_frame = ttk.Frame(main_frame)
+        left_frame.pack(side="left", fill="y", padx=(0, 10))
+        
+        ttk.Label(left_frame, text="Stored Credentials", 
+                 style="Heading.TLabel").pack(pady=5)
+        
+        # Listbox for credentials
+        list_frame = ttk.Frame(left_frame)
+        list_frame.pack(fill="both", expand=True)
+        
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.cred_listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set,
+                                      selectmode="single", height=15)
+        self.cred_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.cred_listbox.yview)
+        
+        # Bind selection event
+        self.cred_listbox.bind('<<ListboxSelect>>', self.on_credential_select)
+        
+        # Refresh list
+        self.refresh_credential_list()
+        
+        # Buttons for left panel
+        button_frame = ttk.Frame(left_frame)
+        button_frame.pack(fill="x", pady=10)
+        
+        ttk.Button(button_frame, text="Add New", 
+                  command=self.show_add_credential_dialog).pack(side="left", padx=2)
+        ttk.Button(button_frame, text="Refresh", 
+                  command=self.refresh_credential_list).pack(side="left", padx=2)
+        ttk.Button(button_frame, text="Delete", 
+                  command=self.delete_selected_credential).pack(side="left", padx=2)
+        
+        # Right panel - Credential details
+        right_frame = ttk.LabelFrame(main_frame, text="Credential Details", padding=10)
+        right_frame.pack(side="right", fill="both", expand=True)
+        
+        # Credential details labels
+        detail_labels = ["Service:", "Username:", "Password:", "URL:", "Notes:"]
+        self.detail_vars = {}
+        
+        for i, label in enumerate(detail_labels):
+            ttk.Label(right_frame, text=label).grid(row=i, column=0, sticky="w", pady=5)
+            var = tk.StringVar()
+            entry = ttk.Entry(right_frame, textvariable=var, state="readonly", width=40)
+            entry.grid(row=i, column=1, sticky="ew", pady=5, padx=(5, 0))
+            self.detail_vars[label[:-1].lower()] = var
+        
+        # Copy buttons
+        button_frame2 = ttk.Frame(right_frame)
+        button_frame2.grid(row=len(detail_labels), column=0, columnspan=2, pady=10)
+        
+        ttk.Button(button_frame2, text="Copy Username", 
+                  command=lambda: self.copy_to_clipboard("username")).pack(side="left", padx=2)
+        ttk.Button(button_frame2, text="Copy Password", 
+                  command=lambda: self.copy_to_clipboard("password")).pack(side="left", padx=2)
+        
+        # Bottom status bar
+        status_frame = ttk.Frame(self.root, relief="sunken", borderwidth=1)
+        status_frame.pack(side="bottom", fill="x")
+        
+        self.status_text = tk.StringVar(value="Ready")
+        ttk.Label(status_frame, textvariable=self.status_text).pack(side="left", padx=5)
+        
+        # Auto-lock warning
+        if self.vault.auto_lock_minutes > 0:
+            lock_text = f"Auto-lock in {self.vault.auto_lock_minutes} min"
+            ttk.Label(status_frame, text=lock_text).pack(side="right", padx=5)
+    
+    def refresh_credential_list(self):
+        """Refresh the list of credentials."""
+        self.cred_listbox.delete(0, tk.END)
+        for service in sorted(self.vault.credentials.keys()):
+            self.cred_listbox.insert(tk.END, service)
+        
+        self.status_text.set(f"Found {len(self.vault.credentials)} credentials")
+    
+    def on_credential_select(self, event):
+        """Handle credential selection from list."""
+        selection = self.cred_listbox.curselection()
+        if not selection:
+            return
+        
+        service = self.cred_listbox.get(selection[0])
+        cred_info = self.vault.get_credential(service)
+        
+        if cred_info:
+            username, password = cred_info
+            cred = self.vault.credentials[service]
+            
+            self.detail_vars["service"].set(service)
+            self.detail_vars["username"].set(username)
+            self.detail_vars["password"].set("••••••••")
+            self.detail_vars["url"].set(cred.url)
+            self.detail_vars["notes"].set(cred.notes)
+    
+    def show_add_credential_dialog(self):
+        """Show dialog to add new credential."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add New Credential")
+        dialog.geometry("400x300")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Form fields
+        fields = [
+            ("Service:", "service"),
+            ("Username/Email:", "username"),
+            ("Password:", "password", True),
+            ("URL (optional):", "url"),
+            ("Notes (optional):", "notes")
+        ]
+        
+        entries = {}
+        
+        for i, (label, key, *options) in enumerate(fields):
+            ttk.Label(dialog, text=label).grid(row=i, column=0, sticky="w", padx=10, pady=5)
+            
+            if options and options[0]:  # Show password as bullets
+                entry = ttk.Entry(dialog, show="•", width=30)
+            else:
+                entry = ttk.Entry(dialog, width=30)
+            
+            entry.grid(row=i, column=1, padx=10, pady=5, sticky="ew")
+            entries[key] = entry
+        
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=len(fields), column=0, columnspan=2, pady=20)
+        
+        def save_credential():
+            try:
+                self.vault.add_credential(
+                    service=entries["service"].get(),
+                    username=entries["username"].get(),
+                    password=entries["password"].get(),
+                    url=entries["url"].get(),
+                    notes=entries["notes"].get()
+                )
+                self.refresh_credential_list()
+                dialog.destroy()
+                messagebox.showinfo("Success", "Credential added successfully!")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to add credential: {str(e)}")
+        
+        ttk.Button(button_frame, text="Save", 
+                  command=save_credential).pack(side="left", padx=5)
+        ttk.Button(button_frame, text="Cancel", 
+                  command=dialog.destroy).pack(side="left", padx=5)
+    
+    def delete_selected_credential(self):
+        """Delete selected credential."""
+        selection = self.cred_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a credential to delete")
+            return
+        
+        service = self.cred_listbox.get(selection[0])
+        
+        if messagebox.askyesno("Confirm Delete", 
+                              f"Delete credential for '{service}'?"):
+            del self.vault.credentials[service]
+            self.refresh_credential_list()
+            # Clear detail fields
+            for var in self.detail_vars.values():
+                var.set("")
+            messagebox.showinfo("Deleted", f"Credential for '{service}' deleted")
+    
+    def copy_to_clipboard(self, field_type):
+        """Copy username or password to clipboard."""
+        selection = self.cred_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a credential first")
+            return
+        
+        service = self.cred_listbox.get(selection[0])
+        cred_info = self.vault.get_credential(service)
+        
+        if not cred_info:
+            messagebox.showerror("Error", "Could not retrieve credential")
+            return
+        
+        username, password = cred_info
+        text_to_copy = username if field_type == "username" else password
+        
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text_to_copy)
+            self.status_text.set(f"Copied {field_type} to clipboard")
+            
+            # Auto-clear clipboard after 30 seconds
+            def clear_clipboard():
+                self.root.clipboard_clear()
+                self.status_text.set("Clipboard cleared for security")
+            
+            self.root.after(30000, clear_clipboard)  # 30 seconds
+            
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to save: {e}")
-
-    def _ensure_unlocked(self) -> bool:
-        if self.master_password is None:
-            messagebox.showwarning("Locked", "Vault is locked. Click Unlock to continue.")
-            return False
-        return True
-
-# ------------------------- Main -------------------------
+            messagebox.showerror("Error", f"Failed to copy to clipboard: {str(e)}")
+    
+    def save_vault(self):
+        """Save vault to disk."""
+        try:
+            self.vault.save_vault()
+            self.status_text.set("Vault saved successfully")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save vault: {str(e)}")
+    
+    def lock_vault(self):
+        """Lock the vault and return to login screen."""
+        self.vault.lock()
+        self.show_login_screen()
+    
+    def on_vault_locked(self):
+        """Called when vault auto-locks."""
+        if messagebox.askyesno("Auto-Locked", 
+                              "Vault has been auto-locked due to inactivity.\n\nReturn to login screen?"):
+            self.root.after(100, self.lock_vault)
+    
+    def run(self):
+        """Start the GUI application."""
+        self.root.mainloop()
 
 def main():
-    if getattr(sys, "frozen", False):
-        base_dir = Path(os.path.dirname(sys.executable))
+    """Main entry point - starts GUI if available, otherwise CLI."""
+    if GUI_AVAILABLE:
+        app = ObscurioGUI()
+        app.run()
     else:
-        base_dir = Path.cwd()
-    vault_path = base_dir / "vault.dat"
-    app = App(vault_path)
-    app.mainloop()
+        print("GUI not available. Starting terminal version...")
+        # Fallback to terminal version
+        import src.obscurio_terminal as terminal
+        terminal.main()
 
 if __name__ == "__main__":
     main()
